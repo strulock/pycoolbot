@@ -1,0 +1,39 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "pycoolbot"
+dynamic = ["version"]
+description = "Async read-only client for the CoolBot Pro walk-in cooler cloud service"
+readme = "README.md"
+license = "MIT"
+license-files = ["LICENSE"]
+authors = [{ name = "strulock" }]
+requires-python = ">=3.11"
+dependencies = ["aiohttp>=3.9"]
+keywords = ["coolbot", "storeitcold", "blynk", "walk-in-cooler", "home-automation"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Developers",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3.11",
+    "Programming Language :: Python :: 3.12",
+    "Programming Language :: Python :: 3.13",
+    "Topic :: Home Automation",
+    "Typing :: Typed",
+]
+
+[project.urls]
+Homepage = "https://github.com/strulock/pycoolbot"
+Repository = "https://github.com/strulock/pycoolbot"
+Issues = "https://github.com/strulock/pycoolbot/issues"
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.hatch.version]
+path = "src/pycoolbot/__init__.py"
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

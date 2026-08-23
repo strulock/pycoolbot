@@ -1,0 +1,294 @@
+"""Async WebSocket client for the CoolBot Pro cloud service."""
+
+from __future__ import annotations
+
+import asyncio
+import itertools
+import logging
+from datetime import UTC, datetime
+from types import TracebackType
+from typing import Any, Self
+
+import aiohttp
+
+from .const import (
+    CMD_APP_SYNC,
+    CMD_DASH_GZIPPED,
+    CMD_HARDWARE,
+    CMD_LOAD_PROFILE_GZIPPED,
+    CMD_LOGIN,
+    CMD_PING,
+    CMD_RESPONSE,
+    COMPRESSED_CMDS,
+    LIVE_PINS,
+    PUSH_INTERVAL_SECONDS,
+    STATUS_OK,
+    WS_URL,
+)
+from .models import CoolbotDevice, build_devices
+from .protocol import (
+    Frame,
+    decode_frames,
+    encode_frame,
+    inflate_json,
+    login_body,
+    parse_pin_update,
+    status_message,
+)
+
+_LOGGER = logging.getLogger(__name__)
+
+
+class CoolbotError(Exception):
+    """Base error."""
+
+
+class CoolbotAuthError(CoolbotError):
+    """Credentials were rejected."""
+
+
+class CoolbotConnectionError(CoolbotError):
+    """The socket could not be established or was lost."""
+
+
+class CoolbotClient:
+    """Speaks the Blynk app protocol to the CoolBot cloud.
+
+    Usage::
+
+        async with CoolbotClient(email, password) as client:
+            devices = await client.async_get_devices()
+
+    The client keeps every pin value it has seen, so a long-lived instance serves
+    push updates as they arrive. ``async_get_devices`` waits for a live push
+    before returning, which is what makes a reading trustworthy: the server
+    replays a cached snapshot on connect, so whatever arrives first can be
+    minutes out of date.
+    """
+
+    def __init__(
+        self,
+        email: str,
+        password: str,
+        session: aiohttp.ClientSession | None = None,
+        *,
+        request_timeout: float = 20.0,
+    ) -> None:
+        self._email = email
+        self._password = password
+        self._session = session
+        self._owns_session = session is None
+        self._request_timeout = request_timeout
+
+        self._ws: aiohttp.ClientWebSocketResponse | None = None
+        self._reader: asyncio.Task[None] | None = None
+        self._ids = itertools.count(1)
+
+        self._pins: dict[str, dict[str, str]] = {}
+        self._live_at: dict[str, datetime] = {}
+        self._profile_records: list[dict[str, Any]] = []
+
+        self._responses: dict[int, asyncio.Future[int]] = {}
+        self._profile_ready = asyncio.Event()
+        self._snapshot_ready = asyncio.Event()
+        self._live_push = asyncio.Event()
+        self._closed = False
+
+    # --- lifecycle ----------------------------------------------------------
+
+    async def __aenter__(self) -> Self:
+        await self.async_connect()
+        return self
+
+    async def __aexit__(
+        self,
+        exc_type: type[BaseException] | None,
+        exc: BaseException | None,
+        tb: TracebackType | None,
+    ) -> None:
+        await self.async_close()
+
+    async def async_connect(self) -> None:
+        """Open the socket, authenticate, and request the account profile."""
+        if self._session is None:
+            self._session = aiohttp.ClientSession()
+
+        try:
+            self._ws = await self._session.ws_connect(WS_URL, heartbeat=None)
+        except (aiohttp.ClientError, asyncio.TimeoutError) as err:
+            raise CoolbotConnectionError(f"could not connect: {err}") from err
+
+        self._reader = asyncio.create_task(self._read_loop())
+
+        status = await self._request(CMD_LOGIN, login_body(self._email, self._password))
+        if status != STATUS_OK:
+            # 5 = user not registered, 6 = not allowed; both mean bad credentials.
+            raise CoolbotAuthError(f"login rejected: {status_message(status)}")
+        _LOGGER.debug("logged in as %s", self._email)
+
+        # The profile arrives as its own frame rather than as a response body.
+        await self._send(CMD_LOAD_PROFILE_GZIPPED)
+        try:
+            await asyncio.wait_for(self._profile_ready.wait(), self._request_timeout)
+        except asyncio.TimeoutError as err:
+            raise CoolbotConnectionError("timed out waiting for the account profile") from err
+
+        # Subscribing to each dashboard makes the server replay every pin value
+        # and start forwarding live pushes.
+        for dash_id in self._dash_ids():
+            await self._send(CMD_APP_SYNC, str(dash_id))
+
+        # The replay arrives as a burst of separate frames, so connecting is not
+        # finished until at least one has landed. Without this a caller that does
+        # not wait for a live push sees an empty pin map and reports no readings.
+        try:
+            await asyncio.wait_for(self._snapshot_ready.wait(), self._request_timeout)
+        except asyncio.TimeoutError:
+            # An account with no provisioned devices legitimately never replays.
+            _LOGGER.warning("no pin values replayed after subscribing")
+
+    async def async_close(self) -> None:
+        self._closed = True
+        if self._reader:
+            self._reader.cancel()
+            try:
+                await self._reader
+            except asyncio.CancelledError:
+                pass
+            self._reader = None
+        if self._ws is not None and not self._ws.closed:
+            await self._ws.close()
+        self._ws = None
+        if self._owns_session and self._session is not None:
+            await self._session.close()
+            self._session = None
+
+    # --- public API ---------------------------------------------------------
+
+    async def async_get_devices(
+        self, *, wait_for_live: bool = True, timeout: float | None = None
+    ) -> list[CoolbotDevice]:
+        """Return every device on the account.
+
+        With ``wait_for_live`` set, waits for a live temperature push so the
+        returned readings are known to be current rather than replayed cache.
+        Falls back to the snapshot if nothing arrives in time; callers can tell
+        the difference from ``data_age_seconds`` being None.
+        """
+        if wait_for_live and not self._live_push.is_set():
+            # Allow a couple of push intervals before giving up.
+            budget = timeout if timeout is not None else PUSH_INTERVAL_SECONDS * 3
+            try:
+                await asyncio.wait_for(self._live_push.wait(), budget)
+            except asyncio.TimeoutError:
+                _LOGGER.warning(
+                    "no live push within %.0fs; readings may be a replayed snapshot", budget
+                )
+
+        return build_devices(self._profile_records, self._pins, self._live_at)
+
+    async def async_ping(self) -> None:
+        """Keep the connection alive."""
+        status = await self._request(CMD_PING)
+        if status != STATUS_OK:
+            raise CoolbotConnectionError(f"ping failed: {status_message(status)}")
+
+    @property
+    def connected(self) -> bool:
+        return self._ws is not None and not self._ws.closed
+
+    # --- internals ----------------------------------------------------------
+
+    def _dash_ids(self) -> list[int]:
+        seen: dict[int, None] = {}
+        for record in self._profile_records:
+            dash_id = record.get("id")
+            if dash_id is not None:
+                seen.setdefault(dash_id, None)
+        return list(seen)
+
+    async def _send(self, cmd: int, body: bytes | str = b"") -> int:
+        if self._ws is None or self._ws.closed:
+            raise CoolbotConnectionError("socket is not open")
+        msg_id = next(self._ids)
+        await self._ws.send_bytes(encode_frame(cmd, msg_id, body))
+        return msg_id
+
+    async def _request(self, cmd: int, body: bytes | str = b"") -> int:
+        """Send a frame and wait for the RESPONSE carrying its status."""
+        loop = asyncio.get_running_loop()
+        future: asyncio.Future[int] = loop.create_future()
+        msg_id = await self._send(cmd, body)
+        self._responses[msg_id] = future
+        try:
+            return await asyncio.wait_for(future, self._request_timeout)
+        except asyncio.TimeoutError as err:
+            raise CoolbotConnectionError(f"no response to command {cmd}") from err
+        finally:
+            self._responses.pop(msg_id, None)
+
+    async def _read_loop(self) -> None:
+        assert self._ws is not None
+        try:
+            async for message in self._ws:
+                if message.type is aiohttp.WSMsgType.BINARY:
+                    for frame in decode_frames(message.data):
+                        self._handle(frame)
+                elif message.type in (aiohttp.WSMsgType.CLOSED, aiohttp.WSMsgType.ERROR):
+                    break
+        except asyncio.CancelledError:
+            raise
+        except Exception:  # noqa: BLE001 - a reader crash must not be silent
+            _LOGGER.exception("websocket reader failed")
+        finally:
+            self._fail_pending()
+
+    def _fail_pending(self) -> None:
+        if self._closed:
+            return
+        for future in self._responses.values():
+            if not future.done():
+                future.set_exception(CoolbotConnectionError("connection closed"))
+        self._responses.clear()
+
+    def _handle(self, frame: Frame) -> None:
+        if frame.cmd == CMD_RESPONSE:
+            future = self._responses.get(frame.msg_id)
+            if future is not None and not future.done():
+                future.set_result(frame.status or 0)
+            return
+
+        if frame.cmd in COMPRESSED_CMDS:
+            self._handle_profile(frame)
+            return
+
+        if frame.cmd in (CMD_HARDWARE, CMD_APP_SYNC):
+            update = parse_pin_update(frame.body)
+            if update is None:
+                return
+            self._pins.setdefault(update.target, {})[update.pin] = update.value
+            self._snapshot_ready.set()
+            # Only a HARDWARE push proves the value is current; APP_SYNC is the
+            # server replaying whatever it had cached when we connected.
+            if frame.cmd == CMD_HARDWARE and update.pin in LIVE_PINS:
+                self._live_at[update.target] = datetime.now(UTC)
+                self._live_push.set()
+
+    def _handle_profile(self, frame: Frame) -> None:
+        payload = inflate_json(frame.body)
+        if payload is None:
+            _LOGGER.debug("could not inflate frame cmd=%s", frame.cmd)
+            return
+
+        if isinstance(payload, dict) and "dashBoards" in payload:
+            records = payload.get("dashBoards") or []
+        elif isinstance(payload, dict):
+            records = [payload]  # a single-dashboard fetch
+        else:
+            return
+
+        self._profile_records.extend(r for r in records if isinstance(r, dict))
+        if frame.cmd == CMD_LOAD_PROFILE_GZIPPED:
+            self._profile_ready.set()
+        elif frame.cmd == CMD_DASH_GZIPPED:
+            self._profile_ready.set()
