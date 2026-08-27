@@ -51,6 +51,23 @@ class CoolbotConnectionError(CoolbotError):
     """The socket could not be established or was lost."""
 
 
+def _discard(future: asyncio.Future[int]) -> None:
+    """Retire a pending response, leaving nothing for asyncio to report.
+
+    A connection closing while a send is suspended lets the reader fail this
+    future before the writer raises its own error. Nobody awaits it after that,
+    so its exception has to be retrieved here; otherwise asyncio reports it as
+    never retrieved when the future is collected. The reader also clears the
+    pending map, so the future is taken directly rather than looked up.
+    """
+    if future.cancelled():
+        return
+    if future.done():
+        future.exception()
+    else:
+        future.cancel()
+
+
 class CoolbotClient:
     """Speaks the Blynk app protocol to the CoolBot cloud.
 
@@ -241,6 +258,7 @@ class CoolbotClient:
             raise CoolbotConnectionError(f"no response to command {cmd}") from err
         finally:
             self._responses.pop(msg_id, None)
+            _discard(future)
 
     async def _read_loop(self) -> None:
         assert self._ws is not None
