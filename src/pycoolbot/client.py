@@ -208,19 +208,34 @@ class CoolbotClient:
         return list(seen)
 
     async def _send(self, cmd: int, body: bytes | str = b"") -> int:
+        msg_id = next(self._ids)
+        await self._send_frame(cmd, msg_id, body)
+        return msg_id
+
+    async def _send_frame(self, cmd: int, msg_id: int, body: bytes | str = b"") -> None:
+        """Write one frame, presenting any socket failure as our own error.
+
+        Callers handle ``CoolbotError``; letting an aiohttp writer error escape
+        raw would bypass their reconnect and cleanup paths.
+        """
         if self._ws is None or self._ws.closed:
             raise CoolbotConnectionError("socket is not open")
-        msg_id = next(self._ids)
-        await self._ws.send_bytes(encode_frame(cmd, msg_id, body))
-        return msg_id
+        try:
+            await self._ws.send_bytes(encode_frame(cmd, msg_id, body))
+        except (aiohttp.ClientError, OSError) as err:
+            raise CoolbotConnectionError(f"could not send command {cmd}: {err}") from err
 
     async def _request(self, cmd: int, body: bytes | str = b"") -> int:
         """Send a frame and wait for the RESPONSE carrying its status."""
         loop = asyncio.get_running_loop()
         future: asyncio.Future[int] = loop.create_future()
-        msg_id = await self._send(cmd, body)
+        # Registered before sending: sending yields to the event loop, so the
+        # reader can receive the response before this coroutine resumes, and an
+        # unregistered response is discarded and then waited out in full.
+        msg_id = next(self._ids)
         self._responses[msg_id] = future
         try:
+            await self._send_frame(cmd, msg_id, body)
             return await asyncio.wait_for(future, self._request_timeout)
         except asyncio.TimeoutError as err:
             raise CoolbotConnectionError(f"no response to command {cmd}") from err
