@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import gc
 
 import aiohttp
 import pytest
@@ -51,6 +52,24 @@ class _FailingSocket:
 
     async def send_bytes(self, data: bytes) -> None:
         raise self._error
+
+
+class _DroppingSocket:
+    """Loses the connection while the send is suspended.
+
+    The reader notices first and fails every pending response; only then does
+    the writer report its own failure.
+    """
+
+    closed = False
+
+    def __init__(self, client: CoolbotClient) -> None:
+        self._client = client
+
+    async def send_bytes(self, data: bytes) -> None:
+        await asyncio.sleep(0)
+        self._client._fail_pending()
+        raise ConnectionResetError("connection reset by peer")
 
 
 def _client() -> CoolbotClient:
@@ -116,6 +135,42 @@ def test_send_failures_are_presented_as_our_own_error(error: BaseException) -> N
             await client._send(CMD_PING)
 
     asyncio.run(scenario())
+
+
+def test_a_drop_during_the_send_leaves_no_unretrieved_exception() -> None:
+    """Both halves of a dropped connection are accounted for.
+
+    The reader fails the pending response while the send is suspended, then the
+    writer raises. Whichever error surfaces, the future must not be discarded
+    with an exception still sitting in it, or asyncio reports it as never
+    retrieved when the future is collected.
+    """
+    unretrieved: list[str] = []
+
+    async def scenario() -> None:
+        loop = asyncio.get_running_loop()
+        loop.set_exception_handler(
+            lambda _loop, context: unretrieved.append(context["message"])
+        )
+        client = _client()
+        client._ws = _DroppingSocket(client)
+
+        raised = False
+        try:
+            await client._request(CMD_PING)
+        except CoolbotConnectionError:
+            # Deliberately not kept: the traceback references the frame holding
+            # the future, which would keep it alive past the collection below.
+            raised = True
+        assert raised
+        assert not client._responses
+
+        # The report happens when the future is finalized, so collect while the
+        # loop is still open and able to hand it to the handler.
+        gc.collect()
+
+    asyncio.run(scenario())
+    assert not [message for message in unretrieved if "never retrieved" in message]
 
 
 def test_sending_without_a_socket_is_a_connection_error() -> None:
