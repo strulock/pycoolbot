@@ -232,10 +232,19 @@ class CoolbotClient:
         try:
             await asyncio.wait_for(self._replay_done.wait(), self._request_timeout)
         except asyncio.TimeoutError:
+            # Whatever did not answer cannot be vouched for: a slot reassigned
+            # to different hardware would otherwise go on offering the previous
+            # occupant's MAC, and be taken for it. Better unidentified than
+            # wrong; the caller sees a device it cannot name yet.
+            unconfirmed = self._replay_expected - self._replay_seen
+            for target in unconfirmed:
+                self._pins.get(target, {}).pop(PIN_MAC_ADDRESS, None)
             _LOGGER.warning(
-                "pins replayed for %d of %d devices after subscribing",
+                "pins replayed for %d of %d devices after subscribing; "
+                "%d left unidentified",
                 len(self._replay_seen & self._replay_expected),
                 len(self._replay_expected),
+                len(unconfirmed),
             )
 
     def _connected_targets(self) -> set[str]:
