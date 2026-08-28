@@ -221,6 +221,62 @@ def test_the_wait_holds_out_for_the_identifying_pin() -> None:
     assert set(asyncio.run(scenario())) == {"coolbot_cccccccccccc"}
 
 
+class _SilentMacService(_Service):
+    """Replays a slot's readings but never its MAC."""
+
+    async def send_bytes(self, data: bytes) -> None:
+        await asyncio.sleep(0)
+        for frame in decode_frames(data):
+            if frame.cmd == CMD_LOAD_PROFILE_GZIPPED:
+                self._client._handle(
+                    Frame(
+                        cmd=CMD_LOAD_PROFILE_GZIPPED,
+                        msg_id=frame.msg_id,
+                        body=zlib.compress(json.dumps(self.profile).encode()),
+                    )
+                )
+            elif frame.cmd == CMD_APP_SYNC:
+                self.syncs.append(frame.body.decode())
+                for target, pins in self.pins.items():
+                    for pin, value in pins.items():
+                        if pin == PIN_MAC_ADDRESS:
+                            continue
+                        self._client._handle(
+                            Frame(cmd=CMD_HARDWARE, msg_id=0, body=_pin_body(target, pin, value))
+                        )
+
+
+def test_a_slot_that_never_answers_is_left_unidentified() -> None:
+    """An unconfirmed slot must not keep answering as its previous occupant.
+
+    The wait for a slot's MAC can time out - the cooler may be unreachable, or
+    the service slow - and if that slot has meanwhile been handed to different
+    hardware, the cached MAC would make the replacement look like its
+    predecessor. Being unable to name it is the honest outcome.
+    """
+
+    async def scenario() -> set[str]:
+        client = _client()
+        service = _Service(client)
+        client._ws = service
+
+        await client.async_refresh_profile()
+        assert set(_by_unique_id(client)) == {"coolbot_aaaaaaaaaaaa"}
+
+        # The slot is reassigned, and this time no MAC comes back.
+        silent = _SilentMacService(client)
+        silent.profile = _profile((0, 99))
+        silent.pins = {"10": {PIN_ROOM_TEMP: "45.0"}}
+        client._ws = silent
+
+        await client.async_refresh_profile()
+        return set(_by_unique_id(client))
+
+    unique_ids = asyncio.run(scenario())
+    assert "coolbot_aaaaaaaaaaaa" not in unique_ids
+    assert unique_ids == {"coolbot_10_0"}
+
+
 def test_pins_for_a_removed_slot_are_forgotten() -> None:
     """A slot that leaves the profile must not keep answering."""
 
