@@ -143,12 +143,7 @@ class CoolbotClient:
             raise CoolbotAuthError(f"login rejected: {status_message(status)}")
         _LOGGER.debug("logged in as %s", self._email)
 
-        # The profile arrives as its own frame rather than as a response body.
-        await self._send(CMD_LOAD_PROFILE_GZIPPED)
-        try:
-            await asyncio.wait_for(self._profile_ready.wait(), self._request_timeout)
-        except asyncio.TimeoutError as err:
-            raise CoolbotConnectionError("timed out waiting for the account profile") from err
+        await self._load_profile()
 
         # Subscribing to each dashboard makes the server replay every pin value
         # and start forwarding live pushes.
@@ -203,6 +198,28 @@ class CoolbotClient:
                 )
 
         return build_devices(self._profile_records, self._pins, self._live_at)
+
+    async def async_refresh_profile(self) -> None:
+        """Re-read the account profile.
+
+        The profile is otherwise read once, while connecting, so a cooler added
+        to or removed from the account is not noticed for as long as the
+        connection lasts. Pin values are kept: they are only ever reported for
+        devices the profile still lists.
+        """
+        await self._load_profile()
+
+    async def _load_profile(self) -> None:
+        """Ask for the account profile and wait for it to arrive.
+
+        It comes back as its own frame rather than as a response body.
+        """
+        self._profile_ready.clear()
+        await self._send(CMD_LOAD_PROFILE_GZIPPED)
+        try:
+            await asyncio.wait_for(self._profile_ready.wait(), self._request_timeout)
+        except asyncio.TimeoutError as err:
+            raise CoolbotConnectionError("timed out waiting for the account profile") from err
 
     async def async_ping(self) -> None:
         """Keep the connection alive."""
@@ -320,8 +337,18 @@ class CoolbotClient:
         else:
             return
 
-        self._profile_records.extend(r for r in records if isinstance(r, dict))
+        fresh = [r for r in records if isinstance(r, dict)]
         if frame.cmd == CMD_LOAD_PROFILE_GZIPPED:
+            # A full profile load is the authoritative account state, so it
+            # replaces what came before. Appending would keep a cooler that has
+            # since been removed, because dashboards are merged by id and the
+            # older record would go on contributing it.
+            self._profile_records = fresh
             self._profile_ready.set()
-        elif frame.cmd == CMD_DASH_GZIPPED:
+            return
+
+        # A per-dashboard fetch describes one dashboard and is merged with the
+        # full profile rather than replacing it.
+        self._profile_records.extend(fresh)
+        if frame.cmd == CMD_DASH_GZIPPED:
             self._profile_ready.set()
