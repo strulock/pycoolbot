@@ -9,9 +9,20 @@ from typing import Any
 
 import pytest
 
-from pycoolbot import CoolbotClient, CoolbotConnectionError, build_devices
-from pycoolbot.const import CMD_DASH_GZIPPED, CMD_LOAD_PROFILE_GZIPPED
-from pycoolbot.protocol import Frame
+from pycoolbot import (
+    CoolbotClient,
+    CoolbotConnectionError,
+    build_devices,
+    target_for,
+)
+from pycoolbot.const import (
+    CMD_APP_SYNC,
+    CMD_DASH_GZIPPED,
+    CMD_HARDWARE,
+    CMD_LOAD_PROFILE_GZIPPED,
+    PIN_MAC_ADDRESS,
+)
+from pycoolbot.protocol import Frame, decode_frames
 
 
 def _profile(*device_ids: int) -> dict[str, Any]:
@@ -69,7 +80,11 @@ def test_a_dashboard_fetch_merges_with_the_profile() -> None:
 
 
 class _ProfileSocket:
-    """Answers a profile request with whatever the test currently serves."""
+    """Answers a profile request with whatever the test currently serves.
+
+    A subscription is answered by replaying a MAC pin per device, which is what
+    the real service does and what the client now waits for.
+    """
 
     closed = False
 
@@ -80,8 +95,22 @@ class _ProfileSocket:
 
     async def send_bytes(self, data: bytes) -> None:
         await asyncio.sleep(0)
-        self.requests += 1
-        self._client._handle(_frame(CMD_LOAD_PROFILE_GZIPPED, self.payload))
+        for frame in decode_frames(data):
+            if frame.cmd == CMD_LOAD_PROFILE_GZIPPED:
+                self.requests += 1
+                self._client._handle(_frame(CMD_LOAD_PROFILE_GZIPPED, self.payload))
+            elif frame.cmd == CMD_APP_SYNC:
+                for dash in self.payload["dashBoards"]:
+                    for device in dash["devices"]:
+                        target = target_for(dash["id"], device["id"])
+                        mac = f"AA:AA:AA:AA:AA:{device['id']:02X}"
+                        self._client._handle(
+                            Frame(
+                                cmd=CMD_HARDWARE,
+                                msg_id=0,
+                                body=f"{target}\0vw\0{PIN_MAC_ADDRESS}\0{mac}".encode(),
+                            )
+                        )
 
 
 def test_refreshing_the_profile_picks_up_a_removed_cooler() -> None:
