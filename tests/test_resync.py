@@ -151,6 +151,76 @@ def test_a_reused_slot_does_not_inherit_the_old_identity() -> None:
     assert devices["coolbot_cccccccccccc"].room_temp_f == 45.0
 
 
+def test_a_reused_slot_does_not_inherit_the_old_readings() -> None:
+    """A new MAC alone must clear whatever the slot answered with before.
+
+    The replay delivers pins in no guaranteed order, and the server may hold
+    nothing but the MAC for hardware that has only just been swapped in. The
+    previous occupant's temperatures, set point, and live timestamp would
+    otherwise surface under the replacement's identity, marked current.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        client = _client()
+        service = _Service(client)
+        client._ws = service
+
+        await client.async_refresh_profile()
+        assert _by_unique_id(client)["coolbot_aaaaaaaaaaaa"].room_temp_f == 38.5
+
+        # Replacement hardware, and the server has only its MAC so far.
+        service.profile = _profile((0, 99))
+        service.pins["10"] = {PIN_MAC_ADDRESS: "CC:CC:CC:CC:CC:CC"}
+
+        await client.async_refresh_profile()
+        return _by_unique_id(client)
+
+    devices = asyncio.run(scenario())
+    assert set(devices) == {"coolbot_cccccccccccc"}
+    assert devices["coolbot_cccccccccccc"].room_temp_f is None
+    assert devices["coolbot_cccccccccccc"].last_data_at is None
+
+
+def test_a_late_mac_does_not_revive_readings_a_timeout_disowned() -> None:
+    """Pins a timed-out replay left behind must not marry a later MAC.
+
+    A timeout means nothing about the slot could be vouched for, so all of its
+    cached state is dropped, not just the MAC. Whichever unit then announces
+    itself starts from a clean slot instead of inheriting those readings.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        client = _client()
+        service = _Service(client)
+        client._ws = service
+
+        await client.async_refresh_profile()
+        assert _by_unique_id(client)["coolbot_aaaaaaaaaaaa"].room_temp_f == 38.5
+
+        # The slot is reassigned; the refresh replays readings but no MAC.
+        silent = _SilentMacService(client)
+        silent.profile = _profile((0, 99))
+        silent.pins = {"10": {PIN_ROOM_TEMP: "45.0"}}
+        client._ws = silent
+
+        await client.async_refresh_profile()
+
+        # The replacement's MAC finally arrives as a live push.
+        client._handle(
+            Frame(
+                cmd=CMD_HARDWARE,
+                msg_id=0,
+                body=_pin_body("10", PIN_MAC_ADDRESS, "CC:CC:CC:CC:CC:CC"),
+            )
+        )
+        return _by_unique_id(client)
+
+    devices = asyncio.run(scenario())
+    assert set(devices) == {"coolbot_cccccccccccc"}
+    assert devices["coolbot_cccccccccccc"].room_temp_f is None
+    assert devices["coolbot_cccccccccccc"].last_data_at is None
+
+
 class _LateMacService(_Service):
     """Replays a slot's temperature promptly and its MAC a beat later.
 

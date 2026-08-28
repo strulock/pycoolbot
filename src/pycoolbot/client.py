@@ -235,10 +235,14 @@ class CoolbotClient:
             # Whatever did not answer cannot be vouched for: a slot reassigned
             # to different hardware would otherwise go on offering the previous
             # occupant's MAC, and be taken for it. Better unidentified than
-            # wrong; the caller sees a device it cannot name yet.
+            # wrong; the caller sees a device it cannot name yet. Everything
+            # cached goes, not just the MAC: readings left behind would be
+            # married to whichever MAC arrives later, and the previous
+            # occupant's temperatures must not surface under its replacement.
             unconfirmed = self._replay_expected - self._replay_seen
             for target in unconfirmed:
-                self._pins.get(target, {}).pop(PIN_MAC_ADDRESS, None)
+                self._pins.pop(target, None)
+                self._live_at.pop(target, None)
             _LOGGER.warning(
                 "pins replayed for %d of %d devices after subscribing; "
                 "%d left unidentified",
@@ -279,6 +283,22 @@ class CoolbotClient:
         return self._ws is not None and not self._ws.closed
 
     # --- internals ----------------------------------------------------------
+
+    def _invalidate_reassigned_slot(self, target: str, mac: str) -> None:
+        """Drop a slot's cached state when its MAC changes.
+
+        A different MAC means the slot has been handed to other hardware. The
+        rest of the cached pins - temperatures, set point, hardware revisions -
+        and the live timestamp still describe the previous occupant, and the
+        replay delivers pins in no guaranteed order, so keeping them until the
+        new unit's own values arrive would publish the old readings, marked
+        current, under the new identity.
+        """
+        known = self._pins.get(target, {}).get(PIN_MAC_ADDRESS)
+        if known is None or known == mac:
+            return
+        self._pins[target] = {}
+        self._live_at.pop(target, None)
 
     def _forget_absent_slots(self, records: list[dict[str, Any]]) -> None:
         """Drop cached pins for slots a new profile no longer holds.
@@ -379,6 +399,8 @@ class CoolbotClient:
             update = parse_pin_update(frame.body)
             if update is None:
                 return
+            if update.pin == PIN_MAC_ADDRESS:
+                self._invalidate_reassigned_slot(update.target, update.value)
             self._pins.setdefault(update.target, {})[update.pin] = update.value
             self._snapshot_ready.set()
 
