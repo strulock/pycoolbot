@@ -25,7 +25,7 @@ from .const import (
     STATUS_OK,
     WS_URL,
 )
-from .models import CoolbotDevice, build_devices
+from .models import CoolbotDevice, build_devices, merge_dashboards, target_for
 from .protocol import (
     Frame,
     decode_frames,
@@ -108,6 +108,10 @@ class CoolbotClient:
         self._responses: dict[int, asyncio.Future[int]] = {}
         self._profile_ready = asyncio.Event()
         self._snapshot_ready = asyncio.Event()
+        #: Slots a subscription is currently waiting to hear pins for.
+        self._replay_expected: set[str] = set()
+        self._replay_seen: set[str] = set()
+        self._replay_done = asyncio.Event()
         self._live_push = asyncio.Event()
         self._closed = False
 
@@ -141,23 +145,12 @@ class CoolbotClient:
         if status != STATUS_OK:
             # 5 = user not registered, 6 = not allowed; both mean bad credentials.
             raise CoolbotAuthError(f"login rejected: {status_message(status)}")
-        _LOGGER.debug("logged in as %s", self._email)
+        # Deliberately without the address: consumers expose this logger to
+        # their users, who share debug logs when asking for help.
+        _LOGGER.debug("logged in")
 
         await self._load_profile()
-
-        # Subscribing to each dashboard makes the server replay every pin value
-        # and start forwarding live pushes.
-        for dash_id in self._dash_ids():
-            await self._send(CMD_APP_SYNC, str(dash_id))
-
-        # The replay arrives as a burst of separate frames, so connecting is not
-        # finished until at least one has landed. Without this a caller that does
-        # not wait for a live push sees an empty pin map and reports no readings.
-        try:
-            await asyncio.wait_for(self._snapshot_ready.wait(), self._request_timeout)
-        except asyncio.TimeoutError:
-            # An account with no provisioned devices legitimately never replays.
-            _LOGGER.warning("no pin values replayed after subscribing")
+        await self._sync_dashboards()
 
     async def async_close(self) -> None:
         self._closed = True
@@ -200,14 +193,58 @@ class CoolbotClient:
         return build_devices(self._profile_records, self._pins, self._live_at)
 
     async def async_refresh_profile(self) -> None:
-        """Re-read the account profile.
+        """Re-read the account profile and resubscribe to its dashboards.
 
         The profile is otherwise read once, while connecting, so a cooler added
         to or removed from the account is not noticed for as long as the
-        connection lasts. Pin values are kept: they are only ever reported for
-        devices the profile still lists.
+        connection lasts. Subscribing again matters as much as the re-read: it
+        is what makes the server replay pin values, so without it a cooler that
+        has just appeared would have no MAC address to be identified by, and a
+        slot handed to different hardware would keep answering with the old
+        unit's values.
         """
         await self._load_profile()
+        await self._sync_dashboards()
+
+    async def _sync_dashboards(self) -> None:
+        """Subscribe to every dashboard and wait for the replayed pins.
+
+        Subscribing makes the server replay every pin value it holds and start
+        forwarding live updates. The replay arrives as a burst of separate
+        frames, so this waits for the devices the profile says have connected
+        before, rather than for the first frame: a caller that then asks for
+        devices would otherwise see whichever pins happened to land first.
+        """
+        self._replay_expected = self._connected_targets()
+        self._replay_seen = set()
+        self._replay_done.clear()
+        self._snapshot_ready.clear()
+
+        for dash_id in self._dash_ids():
+            await self._send(CMD_APP_SYNC, str(dash_id))
+
+        if not self._replay_expected:
+            # An account with no cooler that has ever connected has nothing to
+            # replay, and waiting would only stall for the whole timeout.
+            return
+
+        try:
+            await asyncio.wait_for(self._replay_done.wait(), self._request_timeout)
+        except asyncio.TimeoutError:
+            _LOGGER.warning(
+                "pins replayed for %d of %d devices after subscribing",
+                len(self._replay_seen & self._replay_expected),
+                len(self._replay_expected),
+            )
+
+    def _connected_targets(self) -> set[str]:
+        """Slots the profile says hold a cooler that has connected before."""
+        return {
+            target_for(dash.dash_id, device_id)
+            for dash in merge_dashboards(self._profile_records)
+            for device_id, raw in dash.devices.items()
+            if raw.get("connectTime")
+        }
 
     async def _load_profile(self) -> None:
         """Ask for the account profile and wait for it to arrive.
@@ -232,6 +269,22 @@ class CoolbotClient:
         return self._ws is not None and not self._ws.closed
 
     # --- internals ----------------------------------------------------------
+
+    def _forget_absent_slots(self, records: list[dict[str, Any]]) -> None:
+        """Drop cached pins for slots a new profile no longer holds.
+
+        The service keeps serving plausible values for slots that are empty, so
+        pins left over from a cooler that has been removed would otherwise go on
+        answering for a slot it no longer occupies.
+        """
+        keep = {
+            target_for(dash.dash_id, device_id)
+            for dash in merge_dashboards(records)
+            for device_id in dash.devices
+        }
+        for target in self._pins.keys() - keep:
+            self._pins.pop(target, None)
+            self._live_at.pop(target, None)
 
     def _dash_ids(self) -> list[int]:
         seen: dict[int, None] = {}
@@ -318,6 +371,10 @@ class CoolbotClient:
                 return
             self._pins.setdefault(update.target, {})[update.pin] = update.value
             self._snapshot_ready.set()
+
+            self._replay_seen.add(update.target)
+            if self._replay_expected and self._replay_expected <= self._replay_seen:
+                self._replay_done.set()
             # Only a HARDWARE push proves the value is current; APP_SYNC is the
             # server replaying whatever it had cached when we connected.
             if frame.cmd == CMD_HARDWARE and update.pin in LIVE_PINS:
@@ -339,6 +396,7 @@ class CoolbotClient:
 
         fresh = [r for r in records if isinstance(r, dict)]
         if frame.cmd == CMD_LOAD_PROFILE_GZIPPED:
+            self._forget_absent_slots(fresh)
             # A full profile load is the authoritative account state, so it
             # replaces what came before. Appending would keep a cooler that has
             # since been removed, because dashboards are merged by id and the
