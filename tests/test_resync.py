@@ -151,6 +151,76 @@ def test_a_reused_slot_does_not_inherit_the_old_identity() -> None:
     assert devices["coolbot_cccccccccccc"].room_temp_f == 45.0
 
 
+class _LateMacService(_Service):
+    """Replays a slot's temperature promptly and its MAC a beat later.
+
+    The real burst arrives as separate frames in no guaranteed order, so a
+    caller that stops waiting at the first pin can still be holding the
+    previous occupant's identity.
+    """
+
+    async def send_bytes(self, data: bytes) -> None:
+        await asyncio.sleep(0)
+        for frame in decode_frames(data):
+            if frame.cmd == CMD_LOAD_PROFILE_GZIPPED:
+                self._client._handle(
+                    Frame(
+                        cmd=CMD_LOAD_PROFILE_GZIPPED,
+                        msg_id=frame.msg_id,
+                        body=zlib.compress(json.dumps(self.profile).encode()),
+                    )
+                )
+            elif frame.cmd == CMD_APP_SYNC:
+                self.syncs.append(frame.body.decode())
+                for target, pins in self.pins.items():
+                    for pin, value in pins.items():
+                        if pin == PIN_MAC_ADDRESS:
+                            continue
+                        self._client._handle(
+                            Frame(cmd=CMD_HARDWARE, msg_id=0, body=_pin_body(target, pin, value))
+                        )
+                asyncio.get_running_loop().call_soon(self._replay_macs)
+
+    def _replay_macs(self) -> None:
+        for target, pins in self.pins.items():
+            if PIN_MAC_ADDRESS in pins:
+                self._client._handle(
+                    Frame(
+                        cmd=CMD_HARDWARE,
+                        msg_id=0,
+                        body=_pin_body(target, PIN_MAC_ADDRESS, pins[PIN_MAC_ADDRESS]),
+                    )
+                )
+
+
+def test_the_wait_holds_out_for_the_identifying_pin() -> None:
+    """Other pins landing first must not end the wait.
+
+    A slot's temperature can replay before its MAC, and stopping there would
+    hand back the previous occupant's identity with the new occupant's
+    readings.
+    """
+
+    async def scenario() -> dict[str, Any]:
+        client = _client()
+        service = _LateMacService(client)
+        client._ws = service
+
+        await client.async_refresh_profile()
+        assert set(_by_unique_id(client)) == {"coolbot_aaaaaaaaaaaa"}
+
+        service.profile = _profile((0, 99))
+        service.pins["10"] = {
+            PIN_MAC_ADDRESS: "CC:CC:CC:CC:CC:CC",
+            PIN_ROOM_TEMP: "45.0",
+        }
+
+        await client.async_refresh_profile()
+        return _by_unique_id(client)
+
+    assert set(asyncio.run(scenario())) == {"coolbot_cccccccccccc"}
+
+
 def test_pins_for_a_removed_slot_are_forgotten() -> None:
     """A slot that leaves the profile must not keep answering."""
 

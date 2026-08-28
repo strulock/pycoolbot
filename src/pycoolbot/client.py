@@ -21,6 +21,7 @@ from .const import (
     CMD_RESPONSE,
     COMPRESSED_CMDS,
     LIVE_PINS,
+    PIN_MAC_ADDRESS,
     PUSH_INTERVAL_SECONDS,
     STATUS_OK,
     WS_URL,
@@ -211,9 +212,9 @@ class CoolbotClient:
 
         Subscribing makes the server replay every pin value it holds and start
         forwarding live updates. The replay arrives as a burst of separate
-        frames, so this waits for the devices the profile says have connected
-        before, rather than for the first frame: a caller that then asks for
-        devices would otherwise see whichever pins happened to land first.
+        frames, so this waits until each slot the profile says has connected
+        before has replayed its MAC address. Returning any earlier hands the
+        caller a slot still carrying its previous occupant's identity.
         """
         self._replay_expected = self._connected_targets()
         self._replay_seen = set()
@@ -372,9 +373,13 @@ class CoolbotClient:
             self._pins.setdefault(update.target, {})[update.pin] = update.value
             self._snapshot_ready.set()
 
-            self._replay_seen.add(update.target)
-            if self._replay_expected and self._replay_expected <= self._replay_seen:
-                self._replay_done.set()
+            # Specifically the MAC: it is what a device is identified by, and a
+            # slot's other pins can replay before it. Settling for any pin
+            # would let a caller read the previous occupant's identity.
+            if update.pin == PIN_MAC_ADDRESS:
+                self._replay_seen.add(update.target)
+                if self._replay_expected and self._replay_expected <= self._replay_seen:
+                    self._replay_done.set()
             # Only a HARDWARE push proves the value is current; APP_SYNC is the
             # server replaying whatever it had cached when we connected.
             if frame.cmd == CMD_HARDWARE and update.pin in LIVE_PINS:
