@@ -20,7 +20,7 @@ from .client import (
 from .models import CoolbotDevice, build_devices, target_for
 from .protocol import hash_password
 
-__version__ = "0.1.4"
+__version__ = "0.1.5"
 
 __all__ = [
     "CoolbotAuthError",
