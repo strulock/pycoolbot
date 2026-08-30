@@ -154,6 +154,11 @@ class CoolbotClient:
         await self._sync_dashboards()
 
     async def async_close(self) -> None:
+        """Close the socket and release resources.
+
+        Never raises: closing is best-effort cleanup, usually done while
+        handling some other failure, and an error here must not replace it.
+        """
         self._closed = True
         if self._reader:
             self._reader.cancel()
@@ -163,10 +168,16 @@ class CoolbotClient:
                 pass
             self._reader = None
         if self._ws is not None and not self._ws.closed:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001 - best-effort close, see docstring
+                _LOGGER.debug("error while closing the websocket", exc_info=True)
         self._ws = None
         if self._owns_session and self._session is not None:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception:  # noqa: BLE001 - best-effort close, see docstring
+                _LOGGER.debug("error while closing the session", exc_info=True)
             self._session = None
 
     # --- public API ---------------------------------------------------------
@@ -235,10 +246,14 @@ class CoolbotClient:
             # Whatever did not answer cannot be vouched for: a slot reassigned
             # to different hardware would otherwise go on offering the previous
             # occupant's MAC, and be taken for it. Better unidentified than
-            # wrong; the caller sees a device it cannot name yet.
+            # wrong; the caller sees a device it cannot name yet. Everything
+            # cached goes, not just the MAC: readings left behind would be
+            # married to whichever MAC arrives later, and the previous
+            # occupant's temperatures must not surface under its replacement.
             unconfirmed = self._replay_expected - self._replay_seen
             for target in unconfirmed:
-                self._pins.get(target, {}).pop(PIN_MAC_ADDRESS, None)
+                self._pins.pop(target, None)
+                self._live_at.pop(target, None)
             _LOGGER.warning(
                 "pins replayed for %d of %d devices after subscribing; "
                 "%d left unidentified",
@@ -279,6 +294,22 @@ class CoolbotClient:
         return self._ws is not None and not self._ws.closed
 
     # --- internals ----------------------------------------------------------
+
+    def _invalidate_reassigned_slot(self, target: str, mac: str) -> None:
+        """Drop a slot's cached state when its MAC changes.
+
+        A different MAC means the slot has been handed to other hardware. The
+        rest of the cached pins - temperatures, set point, hardware revisions -
+        and the live timestamp still describe the previous occupant, and the
+        replay delivers pins in no guaranteed order, so keeping them until the
+        new unit's own values arrive would publish the old readings, marked
+        current, under the new identity.
+        """
+        known = self._pins.get(target, {}).get(PIN_MAC_ADDRESS)
+        if known is None or known == mac:
+            return
+        self._pins[target] = {}
+        self._live_at.pop(target, None)
 
     def _forget_absent_slots(self, records: list[dict[str, Any]]) -> None:
         """Drop cached pins for slots a new profile no longer holds.
@@ -379,6 +410,8 @@ class CoolbotClient:
             update = parse_pin_update(frame.body)
             if update is None:
                 return
+            if update.pin == PIN_MAC_ADDRESS:
+                self._invalidate_reassigned_slot(update.target, update.value)
             self._pins.setdefault(update.target, {})[update.pin] = update.value
             self._snapshot_ready.set()
 

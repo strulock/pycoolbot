@@ -181,3 +181,40 @@ def test_sending_without_a_socket_is_a_connection_error() -> None:
             await _client()._send(CMD_PING)
 
     asyncio.run(scenario())
+
+
+class _UncloseableSocket:
+    """A socket whose close itself fails."""
+
+    closed = False
+
+    async def close(self) -> None:
+        raise aiohttp.ClientError("close failed")
+
+
+class _UncloseableSession:
+    """A session whose close itself fails."""
+
+    async def close(self) -> None:
+        raise RuntimeError("session close failed")
+
+
+def test_close_never_raises() -> None:
+    """Closing is best-effort cleanup and must not raise.
+
+    It usually runs while some other failure is being handled - a rejected
+    login, a lost connection - and an error escaping here would replace that
+    failure with cleanup noise.
+    """
+
+    async def scenario() -> None:
+        client = _client()
+        client._ws = _UncloseableSocket()
+        client._session = _UncloseableSession()
+
+        await client.async_close()
+
+        assert client._ws is None
+        assert client._session is None
+
+    asyncio.run(scenario())
