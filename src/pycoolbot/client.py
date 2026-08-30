@@ -154,6 +154,11 @@ class CoolbotClient:
         await self._sync_dashboards()
 
     async def async_close(self) -> None:
+        """Close the socket and release resources.
+
+        Never raises: closing is best-effort cleanup, usually done while
+        handling some other failure, and an error here must not replace it.
+        """
         self._closed = True
         if self._reader:
             self._reader.cancel()
@@ -163,10 +168,16 @@ class CoolbotClient:
                 pass
             self._reader = None
         if self._ws is not None and not self._ws.closed:
-            await self._ws.close()
+            try:
+                await self._ws.close()
+            except Exception:  # noqa: BLE001 - best-effort close, see docstring
+                _LOGGER.debug("error while closing the websocket", exc_info=True)
         self._ws = None
         if self._owns_session and self._session is not None:
-            await self._session.close()
+            try:
+                await self._session.close()
+            except Exception:  # noqa: BLE001 - best-effort close, see docstring
+                _LOGGER.debug("error while closing the session", exc_info=True)
             self._session = None
 
     # --- public API ---------------------------------------------------------
