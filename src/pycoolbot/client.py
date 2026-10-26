@@ -3,8 +3,10 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import itertools
 import logging
+from collections.abc import Callable
 from datetime import UTC, datetime
 from types import TracebackType
 from typing import Any, Self
@@ -114,6 +116,7 @@ class CoolbotClient:
         self._replay_seen: set[str] = set()
         self._replay_done = asyncio.Event()
         self._live_push = asyncio.Event()
+        self._listeners: list[Callable[[], None]] = []
         self._closed = False
 
     # --- lifecycle ----------------------------------------------------------
@@ -182,6 +185,33 @@ class CoolbotClient:
 
     # --- public API ---------------------------------------------------------
 
+    def add_listener(self, listener: Callable[[], None]) -> Callable[[], None]:
+        """Register a callback for live device updates, returning its remover.
+
+        The callback fires when a device pushes something new: a reading whose
+        arrival moves the device's freshness on, or a value that has changed.
+        Unchanged repeats of the settings a device re-announces each cycle do
+        not fire it, so a consumer is not woken several times for one cycle.
+
+        It is called from the task reading the socket, with no data passed, so
+        a consumer reads the current state with :meth:`get_devices`. Keep it
+        short: slow work here holds up the socket.
+        """
+        self._listeners.append(listener)
+
+        def remove() -> None:
+            with contextlib.suppress(ValueError):
+                self._listeners.remove(listener)
+
+        return remove
+
+    def get_devices(self) -> list[CoolbotDevice]:
+        """Return every device on the account, from what has arrived so far.
+
+        Synchronous so that a listener can publish without awaiting.
+        """
+        return build_devices(self._profile_records, self._pins, self._live_at)
+
     async def async_get_devices(
         self, *, wait_for_live: bool = True, timeout: float | None = None
     ) -> list[CoolbotDevice]:
@@ -202,7 +232,7 @@ class CoolbotClient:
                     "no live push within %.0fs; readings may be a replayed snapshot", budget
                 )
 
-        return build_devices(self._profile_records, self._pins, self._live_at)
+        return self.get_devices()
 
     async def async_refresh_profile(self) -> None:
         """Re-read the account profile and resubscribe to its dashboards.
@@ -412,6 +442,7 @@ class CoolbotClient:
                 return
             if update.pin == PIN_MAC_ADDRESS:
                 self._invalidate_reassigned_slot(update.target, update.value)
+            previous = self._pins.get(update.target, {}).get(update.pin)
             self._pins.setdefault(update.target, {})[update.pin] = update.value
             self._snapshot_ready.set()
 
@@ -423,10 +454,31 @@ class CoolbotClient:
                 if self._replay_expected and self._replay_expected <= self._replay_seen:
                     self._replay_done.set()
             # Only a HARDWARE push proves the value is current; APP_SYNC is the
-            # server replaying whatever it had cached when we connected.
-            if frame.cmd == CMD_HARDWARE and update.pin in LIVE_PINS:
+            # server replaying whatever it had cached when we connected, so a
+            # replay must not wake listeners either.
+            if frame.cmd != CMD_HARDWARE:
+                return
+            if update.pin in LIVE_PINS:
                 self._live_at[update.target] = datetime.now(UTC)
                 self._live_push.set()
+                # Freshness moved on even if the temperature itself held steady,
+                # and a consumer gating availability on age needs to hear that.
+                self._notify()
+            elif previous != update.value:
+                self._notify()
+
+    def _notify(self) -> None:
+        """Tell listeners that a device has pushed something new.
+
+        Runs on the task reading the socket, so a listener that raises must not
+        be allowed to take the connection down with it. The list is copied
+        because a listener is free to remove itself while being called.
+        """
+        for listener in list(self._listeners):
+            try:
+                listener()
+            except Exception:  # noqa: BLE001 - one bad listener must not stop the rest
+                _LOGGER.exception("update listener failed")
 
     def _handle_profile(self, frame: Frame) -> None:
         payload = inflate_json(frame.body)
