@@ -181,6 +181,73 @@ def test_a_reused_slot_does_not_inherit_the_old_readings() -> None:
     assert devices["coolbot_cccccccccccc"].last_data_at is None
 
 
+def test_a_reading_ahead_of_the_new_mac_is_not_published_as_the_old_cooler() -> None:
+    """A live push that beats the replacement's MAC waits for it.
+
+    Until the MAC replays, the slot still carries its previous occupant's
+    identity. A listener woken by the new unit's reading in that window would
+    otherwise read the new temperature under the old cooler's name.
+    """
+
+    async def scenario() -> tuple[list[dict[str, Any]], dict[str, Any]]:
+        client = _client()
+        service = _Service(client)
+        client._ws = service
+
+        await client.async_refresh_profile()
+        assert _by_unique_id(client)["coolbot_aaaaaaaaaaaa"].room_temp_f == 38.5
+
+        seen: list[dict[str, Any]] = []
+        client.add_listener(lambda: seen.append(_by_unique_id(client)))
+
+        # Replacement hardware whose reading replays before its MAC.
+        service.profile = _profile((0, 99))
+        service.pins["10"] = {
+            PIN_ROOM_TEMP: "45.0",
+            PIN_MAC_ADDRESS: "CC:CC:CC:CC:CC:CC",
+        }
+
+        await client.async_refresh_profile()
+        return seen, _by_unique_id(client)
+
+    seen, devices = asyncio.run(scenario())
+    assert seen, "the held reading should still notify once identified"
+    for snapshot in seen:
+        assert set(snapshot) == {"coolbot_cccccccccccc"}
+    assert devices["coolbot_cccccccccccc"].room_temp_f == 45.0
+    assert devices["coolbot_cccccccccccc"].last_data_at is not None
+
+
+def test_pins_held_for_an_unconfirmed_slot_are_dropped_on_timeout() -> None:
+    """A slot whose MAC never replays keeps nothing that arrived meanwhile.
+
+    Those readings cannot be attributed to any cooler, and once the wait is
+    over, later pins for the slot are stored as usual.
+    """
+
+    async def scenario() -> tuple[dict[str, Any], dict[str, str]]:
+        client = _client()
+        service = _Service(client)
+        client._ws = service
+
+        await client.async_refresh_profile()
+
+        service.profile = _profile((0, 99))
+        service.pins["10"] = {PIN_ROOM_TEMP: "45.0"}
+
+        await client.async_refresh_profile()
+        devices = _by_unique_id(client)
+
+        client._handle(
+            Frame(cmd=CMD_HARDWARE, msg_id=0, body=_pin_body("10", PIN_ROOM_TEMP, "46.0"))
+        )
+        return devices, client._pins.get("10", {})
+
+    devices, pins = asyncio.run(scenario())
+    assert all(device.room_temp_f is None for device in devices.values())
+    assert pins == {PIN_ROOM_TEMP: "46.0"}
+
+
 def test_a_late_mac_does_not_revive_readings_a_timeout_disowned() -> None:
     """Pins a timed-out replay left behind must not marry a later MAC.
 
