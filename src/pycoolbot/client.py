@@ -30,6 +30,7 @@ from .const import (
 )
 from .models import CoolbotDevice, build_devices, merge_dashboards, target_for
 from .protocol import (
+    MAX_MSG_ID,
     Frame,
     decode_frames,
     encode_frame,
@@ -102,7 +103,9 @@ class CoolbotClient:
 
         self._ws: aiohttp.ClientWebSocketResponse | None = None
         self._reader: asyncio.Task[None] | None = None
-        self._ids = itertools.count(1)
+        # Wraps rather than counting on: the id is 16 bits on the wire, and a
+        # socket kept alive for weeks sends more frames than that.
+        self._ids = itertools.cycle(range(1, MAX_MSG_ID + 1))
 
         self._pins: dict[str, dict[str, str]] = {}
         self._live_at: dict[str, datetime] = {}

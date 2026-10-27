@@ -20,6 +20,8 @@ from .const import (
 
 _HEADER = struct.Struct(">BHH")
 HEADER_SIZE = _HEADER.size
+#: The header carries the message id in 16 bits.
+MAX_MSG_ID = 0xFFFF
 
 
 @dataclass(frozen=True, slots=True)
