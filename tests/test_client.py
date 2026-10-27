@@ -10,7 +10,7 @@ import pytest
 
 from pycoolbot import CoolbotClient, CoolbotConnectionError, CoolbotError
 from pycoolbot.const import CMD_PING, CMD_RESPONSE, STATUS_OK
-from pycoolbot.protocol import Frame, decode_frames
+from pycoolbot.protocol import MAX_MSG_ID, Frame, decode_frames
 
 
 class _RespondingSocket:
@@ -90,6 +90,26 @@ def test_a_response_arriving_during_the_send_is_not_missed() -> None:
         return await client._request(CMD_PING)
 
     assert asyncio.run(scenario()) == STATUS_OK
+
+
+def test_message_ids_wrap_at_the_header_limit() -> None:
+    """A long-lived socket outlasts the 16-bit id and keeps working.
+
+    Counting past the limit made every later frame fail to encode with a
+    ``struct.error``, which callers handling ``CoolbotError`` never see.
+    """
+
+    async def scenario() -> list[int]:
+        client = _client()
+        client._ws = _RespondingSocket(client)
+        sent: list[int] = []
+        for _ in range(MAX_MSG_ID + 1):
+            sent.append(await client._send(CMD_PING))
+        assert await client._request(CMD_PING) == STATUS_OK
+        return sent
+
+    sent = asyncio.run(scenario())
+    assert sent[-2:] == [MAX_MSG_ID, 1]
 
 
 def test_an_unanswered_request_cleans_up_after_itself() -> None:
