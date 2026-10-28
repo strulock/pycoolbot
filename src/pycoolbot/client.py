@@ -32,6 +32,7 @@ from .models import CoolbotDevice, build_devices, merge_dashboards, target_for
 from .protocol import (
     MAX_MSG_ID,
     Frame,
+    PinUpdate,
     decode_frames,
     encode_frame,
     inflate_json,
@@ -118,6 +119,10 @@ class CoolbotClient:
         self._replay_expected: set[str] = set()
         self._replay_seen: set[str] = set()
         self._replay_done = asyncio.Event()
+        #: Slots whose identity a subscription has yet to confirm, and the pins
+        #: that arrived for them meanwhile, with the command and arrival time.
+        self._awaiting_identity: set[str] = set()
+        self._held: dict[str, list[tuple[int, PinUpdate, datetime]]] = {}
         self._live_push = asyncio.Event()
         self._listeners: list[Callable[[], None]] = []
         self._closed = False
@@ -264,7 +269,19 @@ class CoolbotClient:
         self._replay_seen = set()
         self._replay_done.clear()
         self._snapshot_ready.clear()
+        self._awaiting_identity = set(self._replay_expected)
+        self._held = {}
 
+        try:
+            await self._await_replay()
+        finally:
+            # Whatever is still held never had its identity confirmed, so it
+            # cannot be attributed to any cooler. Later pins flow as usual.
+            self._awaiting_identity = set()
+            self._held = {}
+
+    async def _await_replay(self) -> None:
+        """Send the subscriptions and wait for every expected MAC to replay."""
         for dash_id in self._dash_ids():
             await self._send(CMD_APP_SYNC, str(dash_id))
 
@@ -443,32 +460,52 @@ class CoolbotClient:
             update = parse_pin_update(frame.body)
             if update is None:
                 return
-            if update.pin == PIN_MAC_ADDRESS:
-                self._invalidate_reassigned_slot(update.target, update.value)
-            previous = self._pins.get(update.target, {}).get(update.pin)
-            self._pins.setdefault(update.target, {})[update.pin] = update.value
-            self._snapshot_ready.set()
-
-            # Specifically the MAC: it is what a device is identified by, and a
-            # slot's other pins can replay before it. Settling for any pin
-            # would let a caller read the previous occupant's identity.
-            if update.pin == PIN_MAC_ADDRESS:
-                self._replay_seen.add(update.target)
-                if self._replay_expected and self._replay_expected <= self._replay_seen:
-                    self._replay_done.set()
-            # Only a HARDWARE push proves the value is current; APP_SYNC is the
-            # server replaying whatever it had cached when we connected, so a
-            # replay must not wake listeners either.
-            if frame.cmd != CMD_HARDWARE:
+            received_at = datetime.now(UTC)
+            if update.pin != PIN_MAC_ADDRESS and update.target in self._awaiting_identity:
+                # Until the MAC replays, the slot still carries whatever MAC it
+                # had before, which may belong to hardware since replaced.
+                # Storing this now would pair the new unit's readings with the
+                # old unit's identity for anyone reading in the meantime.
+                self._held.setdefault(update.target, []).append(
+                    (frame.cmd, update, received_at)
+                )
                 return
-            if update.pin in LIVE_PINS:
-                self._live_at[update.target] = datetime.now(UTC)
-                self._live_push.set()
-                # Freshness moved on even if the temperature itself held steady,
-                # and a consumer gating availability on age needs to hear that.
-                self._notify()
-            elif previous != update.value:
-                self._notify()
+            self._apply_pin(frame.cmd, update, received_at)
+
+    def _apply_pin(self, cmd: int, update: PinUpdate, received_at: datetime) -> None:
+        """Store one pin value, and tell listeners if it is news."""
+        if update.pin == PIN_MAC_ADDRESS:
+            self._invalidate_reassigned_slot(update.target, update.value)
+        previous = self._pins.get(update.target, {}).get(update.pin)
+        self._pins.setdefault(update.target, {})[update.pin] = update.value
+        self._snapshot_ready.set()
+
+        # Specifically the MAC: it is what a device is identified by, and a
+        # slot's other pins can replay before it. Settling for any pin
+        # would let a caller read the previous occupant's identity.
+        if update.pin == PIN_MAC_ADDRESS:
+            self._replay_seen.add(update.target)
+            if self._replay_expected and self._replay_expected <= self._replay_seen:
+                self._replay_done.set()
+            if update.target in self._awaiting_identity:
+                # Identity confirmed: what arrived meanwhile now belongs to it,
+                # in the order it arrived.
+                self._awaiting_identity.discard(update.target)
+                for held_cmd, held, held_at in self._held.pop(update.target, []):
+                    self._apply_pin(held_cmd, held, held_at)
+        # Only a HARDWARE push proves the value is current; APP_SYNC is the
+        # server replaying whatever it had cached when we connected, so a
+        # replay must not wake listeners either.
+        if cmd != CMD_HARDWARE:
+            return
+        if update.pin in LIVE_PINS:
+            self._live_at[update.target] = received_at
+            self._live_push.set()
+            # Freshness moved on even if the temperature itself held steady,
+            # and a consumer gating availability on age needs to hear that.
+            self._notify()
+        elif previous != update.value:
+            self._notify()
 
     def _notify(self) -> None:
         """Tell listeners that a device has pushed something new.
